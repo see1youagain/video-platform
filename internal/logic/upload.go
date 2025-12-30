@@ -24,29 +24,43 @@ type InitUploadResult struct {
 
 // InitUpload 初始化上传（带墓碑检查和分布式锁）
 func InitUpload(ctx context.Context, userID int, fileName, fileHash string) (*InitUploadResult, error) {
-	// 1. 检查墓碑，防止重复上传已完成的文件
+	// 1. 先检查 Redis 墓碑
 	exists, status, err := redis.CheckTombstone(ctx, userID, fileHash)
 	if err != nil {
-		return nil, fmt.Errorf("check tombstone failed: %w", err)
+		// Redis 错误不致命，继续检查数据库
+		log.Printf("Warning: check tombstone failed: %v", err)
 	}
-	if exists {
-		switch status {
-		case "completed":
-			// 秒传：返回已存在的 content ID
-			contentID, err := redis.GetTombstoneContentID(ctx, userID, fileHash)
-			if err == nil && contentID > 0 {
-				return &InitUploadResult{
-					ContentID: contentID,
-					Status:    "fast_upload",
-				}, nil
-			}
-		case "cancelled":
-			// 允许重新上传，删除旧墓碑
-			_ = redis.DeleteTombstone(ctx, userID, fileHash)
+
+	if exists && status == "completed" {
+		contentID, err := redis.GetTombstoneContentID(ctx, userID, fileHash)
+		if err == nil && contentID > 0 {
+			return &InitUploadResult{
+				ContentID: contentID,
+				Status:    "fast_upload",
+			}, nil
 		}
 	}
 
-	// 2. 获取分布式锁
+	if exists && status == "cancelled" {
+		_ = redis.DeleteTombstone(ctx, userID, fileHash)
+	}
+
+	// 2. 如果 Redis 没有墓碑，再检查数据库（双重保险）
+	if !exists {
+		if uc, err := db.GetUserContentByHash(ctx, userID, fileHash); err == nil && uc.Status == 1 {
+			// 数据库中存在已完成的记录，验证文件是否存在
+			if fm, err := db.GetFileMeta(ctx, fileHash); err == nil && fm.FilePath != "" {
+				// 文件存在，创建墓碑并返回秒传
+				_ = redis.CreateTombstoneNoExpire(ctx, userID, fileHash, uc.ContentID, "completed")
+				return &InitUploadResult{
+					ContentID: uc.ContentID,
+					Status:    "fast_upload",
+				}, nil
+			}
+		}
+	}
+
+	// 3. 获取分布式锁
 	lockKey := fmt.Sprintf("upload:init:%d:%s", userID, fileHash)
 	lock := redis.NewLock(lockKey, 30*time.Second)
 	if err := lock.Lock(ctx); err != nil {
@@ -54,7 +68,7 @@ func InitUpload(ctx context.Context, userID int, fileName, fileHash string) (*In
 	}
 	defer lock.Unlock(ctx)
 
-	// 3. 数据库操作
+	// 4. 数据库操作
 	contentID, err := db.CreateOrUpdateUserFileUploading(ctx, userID, fileName, fileHash)
 	if err != nil {
 		return nil, err
@@ -161,4 +175,107 @@ func DeleteFile(ctx context.Context, userID int, fileHash string) error {
 	_ = redis.DeleteTombstone(ctx, userID, fileHash)
 
 	return nil
+}
+
+// FileInfo 文件信息（用于返回给前端）
+type FileInfo struct {
+	ID        uint   `json:"id"`
+	FileName  string `json:"file_name"`
+	FileHash  string `json:"file_hash"`
+	FileSize  int64  `json:"file_size"`
+	Status    int    `json:"status"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ContentInfo 内容信息
+type ContentInfo struct {
+	ID         uint   `json:"id"`
+	Title      string `json:"title"`
+	SourceHash string `json:"source_hash"`
+	CreatedAt  string `json:"created_at"`
+}
+
+// ListUserFiles 列出用户的文件
+func ListUserFiles(ctx context.Context, userID int) ([]FileInfo, error) {
+	userContents, err := db.GetUserContents(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []FileInfo
+	for _, uc := range userContents {
+		// 获取文件大小
+		var fileSize int64
+		if fm, err := db.GetFileMeta(ctx, uc.FileHash); err == nil {
+			fileSize = fm.FileSize
+		}
+
+		files = append(files, FileInfo{
+			ID:        uc.ID,
+			FileName:  uc.FileName,
+			FileHash:  uc.FileHash,
+			FileSize:  fileSize,
+			Status:    uc.Status,
+			CreatedAt: uc.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	return files, nil
+}
+
+// GetUserFile 获取用户的单个文件
+func GetUserFile(ctx context.Context, userID int, fileHash string) (*FileInfo, error) {
+	uc, err := db.GetUserContentByHash(ctx, userID, fileHash)
+	if err != nil {
+		return nil, err
+	}
+
+	var fileSize int64
+	if fm, err := db.GetFileMeta(ctx, fileHash); err == nil {
+		fileSize = fm.FileSize
+	}
+
+	return &FileInfo{
+		ID:        uc.ID,
+		FileName:  uc.FileName,
+		FileHash:  uc.FileHash,
+		FileSize:  fileSize,
+		Status:    uc.Status,
+		CreatedAt: uc.CreatedAt.Format("2006-01-02 15:04:05"),
+	}, nil
+}
+
+// ListUserContents 列出用户的内容
+func ListUserContents(ctx context.Context, userID int) ([]ContentInfo, error) {
+	contents, err := db.GetContentsByOwner(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []ContentInfo
+	for _, c := range contents {
+		result = append(result, ContentInfo{
+			ID:         c.ID,
+			Title:      c.Title,
+			SourceHash: c.SourceHash,
+			CreatedAt:  c.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	return result, nil
+}
+
+// GetUserContent 获取用户的单个内容
+func GetUserContent(ctx context.Context, userID int, contentID string) (*ContentInfo, error) {
+	content, err := db.GetContentByID(ctx, userID, contentID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ContentInfo{
+		ID:         content.ID,
+		Title:      content.Title,
+		SourceHash: content.SourceHash,
+		CreatedAt:  content.CreatedAt.Format("2006-01-02 15:04:05"),
+	}, nil
 }

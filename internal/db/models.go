@@ -9,6 +9,14 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// User 用户表
+type User struct {
+	ID        uint      `gorm:"primaryKey"`
+	Username  string    `gorm:"uniqueIndex;type:varchar(100);not null"`
+	Password  string    `gorm:"not null"` // 存储 bcrypt 哈希后的字符串，不是明文
+	CreatedAt time.Time
+}
+
 // 物理文件（版本）表：每个 FileMeta 是一个具体文件版本，关联到一个 Content
 type FileMeta struct {
     // 使用文件内容的 MD5 作为主键（若要支持重名文件或重复文件，考虑改用复合主键或自增 ID）
@@ -46,6 +54,7 @@ type UserContent struct {
     FileHash  string    // 用户给该 content 的命名或上传的原始文件名（冗余便于展示）
     Status    int       // 0: 上传中，1: 已完成，2: 转码中
     CreatedAt time.Time
+    UpdatedAt time.Time
 }
 
 // 初始化数据库连接 (标准 Gorm 连接代码)
@@ -68,7 +77,7 @@ func InitDB(dsn string) error {
     sqlDB.SetConnMaxLifetime(time.Hour)
 
     // AutoMigrate：注意顺序，先 Content，再 FileMeta，再 UserContent
-    if err := DB.AutoMigrate(&Content{}, &FileMeta{}, &UserContent{}); err != nil {
+    if err := DB.AutoMigrate(&Content{}, &FileMeta{}, &UserContent{}, &User{}); err != nil {
         return fmt.Errorf("failed to migrate database: %w", err)
     }
     return nil

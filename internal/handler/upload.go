@@ -203,14 +203,92 @@ func CancelUpload(c *gin.Context) {
 	})
 }
 
+// getUserID 从请求上下文中获取用户 ID
 func getUserID(c *gin.Context) int {
-	// TODO: 从 JWT token 或 session 中获取实际用户 ID
-	return 1
+	userID, exists := c.Get("user_id")
+	if !exists {
+		return 0
+	}
+	if id, ok := userID.(int); ok {
+		return id
+	}
+	return 0
 }
 
-// 占位 handler
-func ListFiles(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"files": []string{}}) }
-func GetFile(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{}) }
-func DeleteFile(c *gin.Context)   { c.JSON(http.StatusOK, gin.H{"status": "deleted"}) }
-func ListContents(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"contents": []string{}}) }
-func GetContent(c *gin.Context)   { c.JSON(http.StatusOK, gin.H{}) }
+// ListFiles 列出用户的文件
+func ListFiles(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+
+	files, err := logic.ListUserFiles(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"files": files})
+}
+
+// GetFile 获取文件详情
+func GetFile(c *gin.Context) {
+	userID := getUserID(c)
+	fileHash := c.Param("id")
+
+	file, err := logic.GetUserFile(c.Request.Context(), userID, fileHash)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "文件不存在"})
+		return
+	}
+
+	c.JSON(http.StatusOK, file)
+}
+
+// DeleteFile 删除文件
+func DeleteFile(c *gin.Context) {
+	userID := getUserID(c)
+	fileHash := c.Param("id")
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	if err := logic.DeleteFile(ctx, userID, fileHash); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+// ListContents 列出用户的内容
+func ListContents(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+
+	contents, err := logic.ListUserContents(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"contents": contents})
+}
+
+// GetContent 获取内容详情
+func GetContent(c *gin.Context) {
+	userID := getUserID(c)
+	contentID := c.Param("id")
+
+	content, err := logic.GetUserContent(c.Request.Context(), userID, contentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "内容不存在"})
+		return
+	}
+
+	c.JSON(http.StatusOK, content)
+}

@@ -239,3 +239,100 @@ func UpdateUserContentStatus(ctx context.Context, userID int, contentID uint, st
 		Where("user_id = ? AND content_id = ? AND status = 0", userID, contentID).
 		Update("status", status).Error
 }
+
+// GetUserContents 获取用户的所有文件记录
+func GetUserContents(ctx context.Context, userID int) ([]UserContent, error) {
+	var userContents []UserContent
+	err := DB.WithContext(ctx).
+		Where("user_id = ?", userID).
+		Order("created_at DESC").
+		Find(&userContents).Error
+	return userContents, err
+}
+
+// GetUserContentByHash 根据 hash 获取用户的文件记录
+func GetUserContentByHash(ctx context.Context, userID int, fileHash string) (*UserContent, error) {
+	var uc UserContent
+	err := DB.WithContext(ctx).
+		Where("user_id = ? AND file_hash = ?", userID, fileHash).
+		First(&uc).Error
+	if err != nil {
+		return nil, err
+	}
+	return &uc, nil
+}
+
+// GetFileMeta 获取文件元数据
+func GetFileMeta(ctx context.Context, fileHash string) (*FileMeta, error) {
+	var fm FileMeta
+	err := DB.WithContext(ctx).
+		Where("file_hash = ?", fileHash).
+		First(&fm).Error
+	if err != nil {
+		return nil, err
+	}
+	return &fm, nil
+}
+
+// GetContentsByOwner 获取用户的所有内容
+func GetContentsByOwner(ctx context.Context, userID int) ([]Content, error) {
+	var contents []Content
+	err := DB.WithContext(ctx).
+		Where("owner_id = ?", userID).
+		Order("created_at DESC").
+		Find(&contents).Error
+	return contents, err
+}
+
+// GetContentByID 获取单个内容
+func GetContentByID(ctx context.Context, userID int, contentID string) (*Content, error) {
+	var content Content
+	err := DB.WithContext(ctx).
+		Where("id = ? AND owner_id = ?", contentID, userID).
+		First(&content).Error
+	if err != nil {
+		return nil, err
+	}
+	return &content, nil
+}
+
+// GetCompletedUploadsForTombstone 获取所有已完成的上传记录（用于启动时加载墓碑）
+func GetCompletedUploadsForTombstone(ctx context.Context) ([]struct {
+	UserID    int
+	FileHash  string
+	ContentID uint
+	Status    int
+}, error) {
+	var results []struct {
+		UserID    int
+		FileHash  string
+		ContentID uint
+		Status    int
+	}
+
+	// 查询所有有 FileHash 的 UserContent 记录
+	err := DB.WithContext(ctx).
+		Model(&UserContent{}).
+		Select("user_id, file_hash, content_id, status").
+		Where("file_hash != '' AND file_hash IS NOT NULL").
+		Find(&results).Error
+
+	return results, err
+}
+
+// GetFileMetaHashes 获取所有存在的文件哈希（用于验证文件是否真实存在）
+func GetFileMetaHashes(ctx context.Context) (map[string]bool, error) {
+	var hashes []string
+	err := DB.WithContext(ctx).
+		Model(&FileMeta{}).
+		Pluck("file_hash", &hashes).Error
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]bool)
+	for _, h := range hashes {
+		result[h] = true
+	}
+	return result, nil
+}
