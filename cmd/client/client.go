@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -28,7 +29,6 @@ var (
 	username  string
 )
 
-// 响应结构
 type AuthResponse struct {
 	Token string `json:"token"`
 	Msg   string `json:"msg"`
@@ -36,9 +36,10 @@ type AuthResponse struct {
 }
 
 type InitResponse struct {
-	Status    string `json:"status"`
-	ContentID uint   `json:"content_id"`
-	Error     string `json:"error"`
+	Status         string `json:"status"`
+	ContentID      uint   `json:"content_id"`
+	UploadedChunks []int  `json:"uploaded_chunks"`
+	Error          string `json:"error"`
 }
 
 type FileInfo struct {
@@ -68,7 +69,6 @@ type ContentsResponse struct {
 }
 
 func main() {
-	// 解析命令行参数
 	user := flag.String("u", "", "用户名")
 	pass := flag.String("p", "", "密码")
 	flag.Parse()
@@ -80,7 +80,6 @@ func main() {
 
 	username = *user
 
-	// 尝试登录
 	fmt.Printf("正在登录用户 %s...\n", username)
 	if err := login(username, *pass); err != nil {
 		fmt.Printf("登录失败: %v\n", err)
@@ -98,8 +97,6 @@ func main() {
 
 	fmt.Printf("✅ 登录成功！欢迎 %s\n", username)
 	fmt.Println("输入 'help' 查看可用命令")
-
-	// 进入交互式命令行
 	runInteractiveShell()
 }
 
@@ -174,7 +171,7 @@ func runInteractiveShell() {
 }
 
 func showHelp() {
-	help := `
+	fmt.Println(`
 可用命令:
   help, h           显示帮助信息
   upload, up <文件>  上传文件
@@ -185,9 +182,7 @@ func showHelp() {
   info <hash>       查看文件详情
   whoami            显示当前用户
   clear, cls        清屏
-  exit, quit, q     退出程序
-`
-	fmt.Println(help)
+  exit, quit, q     退出程序`)
 }
 
 func cmdUpload(filePath string) {
@@ -210,11 +205,11 @@ func cmdUpload(filePath string) {
 	fileSize := int64(len(fileContent))
 
 	fmt.Printf("文件: %s\n", fileName)
-	fmt.Printf("大小: %d bytes\n", fileSize)
+	fmt.Printf("大小: %s\n", formatSize(fileSize))
 	fmt.Printf("MD5:  %s\n", fileHash)
 
-	// 初始化上传
 	initResp, err := initUpload(fileHash, fileName, fileSize)
+	fmt.Println("初始化上传...",initResp)
 	if err != nil {
 		fmt.Printf("初始化上传失败: %v\n", err)
 		return
@@ -225,20 +220,49 @@ func cmdUpload(filePath string) {
 		return
 	}
 
-	fmt.Printf("ContentID: %d，开始分片上传...\n", initResp.ContentID)
-
-	// 分片上传
-	file, _ := os.Open(filePath)
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Printf("打开文件失败: %v\n", err)
+		return
+	}
 	defer file.Close()
+
 	fi, _ := file.Stat()
 	totalChunks := int(fi.Size()+ChunkSize-1) / ChunkSize
 
+	uploadedSet := make(map[int]bool)
+	for _, idx := range initResp.UploadedChunks {
+		uploadedSet[idx] = true
+	}
+
+	skipCount := len(initResp.UploadedChunks)
+	needUpload := totalChunks - skipCount
+
+	if initResp.Status == "resumable" && skipCount > 0 {
+		fmt.Printf("🔄 断点续传：已上传 %d/%d 分片，继续上传剩余 %d 分片\n",
+			skipCount, totalChunks, needUpload)
+	} else {
+		fmt.Printf("ContentID: %d，开始分片上传 (%d 个分片)...\n", initResp.ContentID, totalChunks)
+	}
+
+	if needUpload == 0 {
+		fmt.Println("所有分片已上传，请求合并...")
+		if mergeChunks(fileHash, initResp.ContentID, totalChunks, fileName, fi.Size()) {
+			fmt.Println("🎉 上传成功！")
+		}
+		return
+	}
+
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 5)
-	successCount := 0
+	semaphore := make(chan struct{}, 3)
+	successCount := skipCount
 	var mu sync.Mutex
 
 	for i := 0; i < totalChunks; i++ {
+		if uploadedSet[i] {
+			continue
+		}
+
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -249,23 +273,36 @@ func cmdUpload(filePath string) {
 			n, err := file.ReadAt(partBuffer, int64(idx)*int64(ChunkSize))
 			if n <= 0 {
 				if err != nil && err != io.EOF {
-					fmt.Printf("读取分片 %d 失败: %v\n", idx, err)
+					fmt.Printf("\n读取分片 %d 失败: %v\n", idx, err)
 				}
 				return
 			}
 
-			if uploadChunk(fileHash, initResp.ContentID, idx, totalChunks, partBuffer[:n]) {
-				mu.Lock()
+			success := false
+			for retry := 0; retry < 3; retry++ {
+				if uploadChunk(fileHash, initResp.ContentID, idx, totalChunks, partBuffer[:n]) {
+					success = true
+					break
+				}
+				time.Sleep(time.Duration(retry+1) * 500 * time.Millisecond)
+			}
+
+			mu.Lock()
+			if success {
 				successCount++
 				fmt.Printf("\r上传进度: %d/%d", successCount, totalChunks)
-				mu.Unlock()
 			}
+			mu.Unlock()
 		}(i)
 	}
 	wg.Wait()
 	fmt.Println()
 
-	// 合并
+	if successCount != totalChunks {
+		fmt.Printf("⚠️ 上传未完成：%d/%d 分片成功，请重新运行继续上传\n", successCount, totalChunks)
+		return
+	}
+
 	fmt.Println("请求合并分片...")
 	if mergeChunks(fileHash, initResp.ContentID, totalChunks, fileName, fi.Size()) {
 		fmt.Println("🎉 上传成功！")
@@ -274,8 +311,7 @@ func cmdUpload(filePath string) {
 
 func cmdList() {
 	req, _ := authRequest("GET", ServerURL+"/files", nil)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		fmt.Printf("请求失败: %v\n", err)
 		return
@@ -301,31 +337,19 @@ func cmdList() {
 	fmt.Println(strings.Repeat("-", 80))
 
 	for _, f := range result.Files {
-		status := "未知"
-		switch f.Status {
-		case 0:
-			status = "上传中"
-		case 1:
-			status = "已完成"
-		case 2:
-			status = "转码中"
-		case -1:
-			status = "已取消"
+		status := map[int]string{0: "上传中", 1: "已完成", 2: "转码中", -1: "已取消"}[f.Status]
+		if status == "" {
+			status = "未知"
 		}
 		fmt.Printf("%-4d %-20s %-34s %-10s %-8s\n",
-			f.ID,
-			truncate(f.FileName, 18),
-			f.FileHash,
-			formatSize(f.FileSize),
-			status)
+			f.ID, truncate(f.FileName, 18), f.FileHash, formatSize(f.FileSize), status)
 	}
 	fmt.Println(strings.Repeat("-", 80))
 }
 
 func cmdContents() {
 	req, _ := authRequest("GET", ServerURL+"/contents", nil)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		fmt.Printf("请求失败: %v\n", err)
 		return
@@ -334,11 +358,6 @@ func cmdContents() {
 
 	var result ContentsResponse
 	json.NewDecoder(resp.Body).Decode(&result)
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("获取内容列表失败: %s\n", result.Error)
-		return
-	}
 
 	if len(result.Contents) == 0 {
 		fmt.Println("暂无内容")
@@ -349,12 +368,8 @@ func cmdContents() {
 	fmt.Println(strings.Repeat("-", 70))
 	fmt.Printf("%-4s %-25s %-34s\n", "ID", "标题", "SourceHash")
 	fmt.Println(strings.Repeat("-", 70))
-
 	for _, c := range result.Contents {
-		fmt.Printf("%-4d %-25s %-34s\n",
-			c.ID,
-			truncate(c.Title, 23),
-			c.SourceHash)
+		fmt.Printf("%-4d %-25s %-34s\n", c.ID, truncate(c.Title, 23), c.SourceHash)
 	}
 	fmt.Println(strings.Repeat("-", 70))
 }
@@ -363,10 +378,8 @@ func cmdDownload(fileHash, savePath string) {
 	if savePath == "" {
 		savePath = "./" + fileHash
 	}
-
 	req, _ := authRequest("GET", ServerURL+"/files/"+fileHash+"/download", nil)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		fmt.Printf("下载失败: %v\n", err)
 		return
@@ -392,58 +405,48 @@ func cmdDownload(fileHash, savePath string) {
 
 func cmdDelete(fileHash string) {
 	req, _ := authRequest("DELETE", ServerURL+"/files/"+fileHash, nil)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		fmt.Printf("删除失败: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK {
 		fmt.Println("✅ 删除成功")
 	} else {
+		body, _ := io.ReadAll(resp.Body)
 		fmt.Printf("删除失败: %s\n", string(body))
 	}
 }
 
 func cmdInfo(fileHash string) {
 	req, _ := authRequest("GET", ServerURL+"/files/"+fileHash, nil)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		fmt.Printf("获取信息失败: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	var result FileInfo
-	json.NewDecoder(resp.Body).Decode(&result)
-
 	if resp.StatusCode != http.StatusOK {
 		fmt.Println("文件不存在或无权访问")
 		return
 	}
 
-	fmt.Printf("\n文件信息:\n")
-	fmt.Printf("  ID:       %d\n", result.ID)
-	fmt.Printf("  文件名:   %s\n", result.FileName)
-	fmt.Printf("  Hash:     %s\n", result.FileHash)
-	fmt.Printf("  大小:     %s\n", formatSize(result.FileSize))
-	fmt.Printf("  创建时间: %s\n", result.CreatedAt)
+	var result FileInfo
+	json.NewDecoder(resp.Body).Decode(&result)
+	fmt.Printf("\n文件信息:\n  ID: %d\n  文件名: %s\n  Hash: %s\n  大小: %s\n  创建时间: %s\n",
+		result.ID, result.FileName, result.FileHash, formatSize(result.FileSize), result.CreatedAt)
 }
 
-// ================== 辅助函数 ==================
-
-func register(username, password string) error {
-	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
+func register(user, pass string) error {
+	body, _ := json.Marshal(map[string]string{"username": user, "password": pass})
 	resp, err := http.Post(ServerURL+"/auth/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	var result AuthResponse
 	json.NewDecoder(resp.Body).Decode(&result)
 	if resp.StatusCode != http.StatusOK {
@@ -452,14 +455,13 @@ func register(username, password string) error {
 	return nil
 }
 
-func login(username, password string) error {
-	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
+func login(user, pass string) error {
+	body, _ := json.Marshal(map[string]string{"username": user, "password": pass})
 	resp, err := http.Post(ServerURL+"/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	var result AuthResponse
 	json.NewDecoder(resp.Body).Decode(&result)
 	if resp.StatusCode != http.StatusOK {
@@ -484,13 +486,11 @@ func initUpload(fileHash, fileName string, fileSize int64) (*InitResponse, error
 	})
 	req, _ := authRequest("POST", ServerURL+"/upload/init", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	var result InitResponse
 	json.NewDecoder(resp.Body).Decode(&result)
 	if resp.StatusCode != http.StatusOK {
@@ -512,8 +512,7 @@ func uploadChunk(fileHash string, contentID uint, index, totalChunks int, data [
 
 	req, _ := authRequest("POST", ServerURL+"/upload/chunk", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	resp, err := (&http.Client{}).Do(req)
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
 		return false
 	}
@@ -528,14 +527,12 @@ func mergeChunks(fileHash string, contentID uint, totalChunks int, fileName stri
 	})
 	req, _ := authRequest("POST", ServerURL+"/upload/merge", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		fmt.Printf("合并失败: %v\n", err)
 		return false
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Printf("合并失败: %s\n", string(body))
@@ -552,12 +549,14 @@ func truncate(s string, maxLen int) string {
 }
 
 func formatSize(size int64) string {
-	if size < 1024 {
+	switch {
+	case size < 1024:
 		return fmt.Sprintf("%dB", size)
-	} else if size < 1024*1024 {
+	case size < 1024*1024:
 		return fmt.Sprintf("%.1fKB", float64(size)/1024)
-	} else if size < 1024*1024*1024 {
+	case size < 1024*1024*1024:
 		return fmt.Sprintf("%.1fMB", float64(size)/(1024*1024))
+	default:
+		return fmt.Sprintf("%.1fGB", float64(size)/(1024*1024*1024))
 	}
-	return fmt.Sprintf("%.1fGB", float64(size)/(1024*1024*1024))
 }

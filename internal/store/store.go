@@ -5,118 +5,233 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 )
 
-// Uploader 定义了文件如何保存
+// Uploader 定义文件存储接口
 type Uploader interface {
-    // WriteChunk 写入分片
-    WriteChunk(hash string, index int, content io.Reader) error
-    // MergeChunks 合并分片
-    MergeChunks(hash string, totalChunks int) (string, error)
+	WriteChunk(userID int, hash string, index int, content io.Reader) error
+	MergeChunks(userID int, hash string, totalChunks int) (filePath string, fileSize int64, err error)
+	GetUploadedChunks(userID int, hash string) ([]int, error)
+	CleanupChunks(userID int, hash string) error
+	GetFile(hash string) (io.ReadCloser, int64, error)
+	GetFileRange(hash string, start, end int64) (io.ReadCloser, error)
+	DeleteFile(hash string) error
+	FileExists(hash string) bool
 }
 
 // LocalStore 本地文件系统实现
 type LocalStore struct {
-    BasePath string
-    TempPath string
+	BasePath string
+	TempPath string
 }
 
-
-func (s *LocalStore) ensureDirs() error {
-    if s.TempPath == "" || s.BasePath == "" {
-        return fmt.Errorf("BasePath or TempPath not set")
-    }
-    if err := os.MkdirAll(s.TempPath, 0755); err != nil {
-        return err
-    }
-    if err := os.MkdirAll(s.BasePath, 0755); err != nil {
-        return err
-    }
-    return nil
+// NewLocalStore 创建本地存储
+func NewLocalStore(basePath, tempPath string) *LocalStore {
+	// 确保目录存在
+	os.MkdirAll(basePath, 0755)
+	os.MkdirAll(tempPath, 0755)
+	return &LocalStore{
+		BasePath: basePath,
+		TempPath: tempPath,
+	}
 }
 
-func chunkName(hash string, index int) string {
-    return fmt.Sprintf("%s.part.%d", hash, index)
+func (s *LocalStore) getChunkDir(userID int, hash string) string {
+	return filepath.Join(s.TempPath, fmt.Sprintf("%d", userID), hash)
 }
 
-// WriteChunk 将单个分片写入临时目录，index 可从 0 或 1 开始（合并时会兼容）
-func (s *LocalStore) WriteChunk(hash string, index int, content io.Reader) error {
-    if err := s.ensureDirs(); err != nil {
-        return err
-    }
-    fname := filepath.Join(s.TempPath, chunkName(hash, index))
-    f, err := os.Create(fname)
-    if err != nil {
-        return fmt.Errorf("create chunk file: %w", err)
-    }
-    defer f.Close()
-    if _, err := io.Copy(f, content); err != nil {
-        return fmt.Errorf("write chunk content: %w", err)
-    }
-    return nil
+func (s *LocalStore) getChunkPath(userID int, hash string, index int) string {
+	return filepath.Join(s.getChunkDir(userID, hash), fmt.Sprintf("%d.part", index))
 }
 
-// findPart 尝试按 index 或 index+1 找到分片文件（兼容从 0/1 开始）
-func (s *LocalStore) findPart(hash string, idx int) (string, error) {
-    candidates := []string{
-        filepath.Join(s.TempPath, chunkName(hash, idx)),
-        filepath.Join(s.TempPath, chunkName(hash, idx+1)),
-    }
-    for _, p := range candidates {
-        if _, err := os.Stat(p); err == nil {
-            return p, nil
-        }
-    }
-    return "", fmt.Errorf("chunk not found for index %d", idx)
+func (s *LocalStore) getFilePath(hash string) string {
+	return filepath.Join(s.BasePath, hash)
 }
 
-// MergeChunks 将所有分片按索引顺序合并到目标文件并删除分片，返回合并后文件路径
-func (s *LocalStore) MergeChunks(hash string, totalChunks int) (string, error) {
-    if err := s.ensureDirs(); err != nil {
-        return "", err
-    }
-    destPath := filepath.Join(s.BasePath, hash)
-    tmpDest := destPath + ".tmp"
+// WriteChunk 写入分片
+func (s *LocalStore) WriteChunk(userID int, hash string, index int, content io.Reader) error {
+	chunkDir := s.getChunkDir(userID, hash)
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		return fmt.Errorf("create chunk dir failed: %w", err)
+	}
 
-    out, err := os.Create(tmpDest)
-    if err != nil {
-        return "", fmt.Errorf("create dest file: %w", err)
-    }
+	chunkPath := s.getChunkPath(userID, hash, index)
+	tmpPath := chunkPath + ".tmp"
 
-    for i := 0; i < totalChunks; i++ {
-        partFile, err := s.findPart(hash, i)
-        if err != nil {
-            out.Close()
-            os.Remove(tmpDest)
-            return "", fmt.Errorf("find part %d: %w", i, err)
-        }
-        pf, err := os.Open(partFile)
-        if err != nil {
-            out.Close()
-            os.Remove(tmpDest)
-            return "", fmt.Errorf("open part %s: %w", partFile, err)
-        }
-        if _, err := io.Copy(out, pf); err != nil {
-            pf.Close()
-            out.Close()
-            os.Remove(tmpDest)
-            return "", fmt.Errorf("copy part %s: %w", partFile, err)
-        }
-        pf.Close()
-        // 删除分片文件
-        _ = os.Remove(partFile)
-    }
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create chunk file failed: %w", err)
+	}
 
-    if err := out.Close(); err != nil {
-        os.Remove(tmpDest)
-        return "", fmt.Errorf("close dest file: %w", err)
-    }
+	written, err := io.Copy(f, content)
+	if err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write chunk failed: %w", err)
+	}
+	f.Close()
 
-    if err := os.Rename(tmpDest, destPath); err != nil {
-        return "", fmt.Errorf("rename temp to dest: %w", err)
-    }
+	if written == 0 {
+		os.Remove(tmpPath)
+		return fmt.Errorf("empty chunk data")
+	}
 
-    return destPath, nil
+	if err := os.Rename(tmpPath, chunkPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename chunk failed: %w", err)
+	}
+
+	return nil
 }
 
-// 重点：未来只需新增一个 MinIOStore 实现这个接口即可。
+// GetUploadedChunks 获取已上传的分片索引
+func (s *LocalStore) GetUploadedChunks(userID int, hash string) ([]int, error) {
+	chunkDir := s.getChunkDir(userID, hash)
+
+	entries, err := os.ReadDir(chunkDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []int{}, nil
+		}
+		return nil, err
+	}
+
+	var chunks []int
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasSuffix(name, ".part") {
+			indexStr := strings.TrimSuffix(name, ".part")
+			if index, err := strconv.Atoi(indexStr); err == nil {
+				chunks = append(chunks, index)
+			}
+		}
+	}
+
+	sort.Ints(chunks)
+	return chunks, nil
+}
+
+// MergeChunks 合并分片
+func (s *LocalStore) MergeChunks(userID int, hash string, totalChunks int) (string, int64, error) {
+	if err := os.MkdirAll(s.BasePath, 0755); err != nil {
+		return "", 0, fmt.Errorf("create base dir failed: %w", err)
+	}
+
+	destPath := s.getFilePath(hash)
+	tmpDest := destPath + ".tmp"
+
+	out, err := os.Create(tmpDest)
+	if err != nil {
+		return "", 0, fmt.Errorf("create dest file failed: %w", err)
+	}
+
+	var totalSize int64
+
+	for i := 0; i < totalChunks; i++ {
+		chunkPath := s.getChunkPath(userID, hash, i)
+
+		pf, err := os.Open(chunkPath)
+		if err != nil {
+			out.Close()
+			os.Remove(tmpDest)
+			return "", 0, fmt.Errorf("open chunk %d failed: %w", i, err)
+		}
+
+		written, err := io.Copy(out, pf)
+		pf.Close()
+
+		if err != nil {
+			out.Close()
+			os.Remove(tmpDest)
+			return "", 0, fmt.Errorf("copy chunk %d failed: %w", i, err)
+		}
+
+		totalSize += written
+	}
+
+	if err := out.Close(); err != nil {
+		os.Remove(tmpDest)
+		return "", 0, fmt.Errorf("close dest file failed: %w", err)
+	}
+
+	if err := os.Rename(tmpDest, destPath); err != nil {
+		os.Remove(tmpDest)
+		return "", 0, fmt.Errorf("rename to dest failed: %w", err)
+	}
+
+	// 清理分片
+	s.CleanupChunks(userID, hash)
+
+	return destPath, totalSize, nil
+}
+
+// CleanupChunks 清理分片临时文件
+func (s *LocalStore) CleanupChunks(userID int, hash string) error {
+	chunkDir := s.getChunkDir(userID, hash)
+	return os.RemoveAll(chunkDir)
+}
+
+// GetFile 获取文件
+func (s *LocalStore) GetFile(hash string) (io.ReadCloser, int64, error) {
+	filePath := s.getFilePath(hash)
+
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return f, fi.Size(), nil
+}
+
+// GetFileRange 获取文件指定范围
+func (s *LocalStore) GetFileRange(hash string, start, end int64) (io.ReadCloser, error) {
+	filePath := s.getFilePath(hash)
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	length := end - start + 1
+	return &limitedReadCloser{
+		Reader: io.LimitReader(f, length),
+		Closer: f,
+	}, nil
+}
+
+// DeleteFile 删除文件
+func (s *LocalStore) DeleteFile(hash string) error {
+	filePath := s.getFilePath(hash)
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// FileExists 检查文件是否存在
+func (s *LocalStore) FileExists(hash string) bool {
+	filePath := s.getFilePath(hash)
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}

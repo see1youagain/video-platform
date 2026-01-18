@@ -3,7 +3,11 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"video-platform/internal/logic"
@@ -36,19 +40,10 @@ func InitUpload(c *gin.Context) {
 		return
 	}
 
-	// 秒传情况
-	if result.Status == "fast_upload" {
-		c.JSON(http.StatusOK, gin.H{
-			"status":     "fast_upload",
-			"content_id": result.ContentID,
-			"message":    "File already exists, fast upload completed",
-		})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"status":     "initialized",
-		"content_id": result.ContentID,
+		"status":          result.Status,
+		"content_id":      result.ContentID,
+		"uploaded_chunks": result.UploadedChunks,
 	})
 }
 
@@ -64,27 +59,73 @@ type UploadChunkRequest struct {
 func UploadChunk(c *gin.Context) {
 	var req UploadChunkRequest
 	if err := c.ShouldBind(&req); err != nil {
+		log.Printf("UploadChunk bind error: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	userID := getUserID(c)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	if userID == 0 {
+		log.Printf("UploadChunk: userID is 0")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
 
-	// 检查墓碑，防止向已完成的上传继续发送分块
-	if err := logic.CheckBeforeUploadChunk(ctx, userID, req.FileHash); err != nil {
+	// 获取分块文件
+	file, err := c.FormFile("chunk")
+	if err != nil {
+		log.Printf("UploadChunk FormFile error: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No chunk file provided: " + err.Error()})
+		return
+	}
+
+	log.Printf("UploadChunk: userID=%d, hash=%s, index=%d, fileSize=%d",
+		userID, req.FileHash, req.ChunkIndex, file.Size)
+
+	// 打开文件
+	src, err := file.Open()
+	if err != nil {
+		log.Printf("UploadChunk Open error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open chunk file: " + err.Error()})
+		return
+	}
+	defer src.Close()
+
+	// 上传分片
+	params := logic.UploadChunkParams{
+		UserID:      userID,
+		FileHash:    req.FileHash,
+		ContentID:   req.ContentID,
+		ChunkIndex:  req.ChunkIndex,
+		TotalChunks: req.TotalChunks,
+		Content:     src,
+	}
+
+	err = logic.UploadChunk(ctx, params)
+	if err != nil {
+		log.Printf("UploadChunk logic error: %v", err)
 		if errors.Is(err, logic.ErrUploadAlreadyCompleted) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":   "Upload already completed",
-				"message": "This file has been uploaded, please use fast upload",
+				"message": "This file has been uploaded",
 			})
 			return
 		}
 		if errors.Is(err, logic.ErrUploadCancelled) {
 			c.JSON(http.StatusGone, gin.H{
 				"error":   "Upload cancelled",
-				"message": "This upload was cancelled, please reinitialize",
+				"message": "Please reinitialize upload",
+			})
+			return
+		}
+		if errors.Is(err, logic.ErrChunkAlreadyUploaded) {
+			// 幂等性：分片已上传，返回成功
+			c.JSON(http.StatusOK, gin.H{
+				"status":      "chunk_exists",
+				"chunk_index": req.ChunkIndex,
 			})
 			return
 		}
@@ -92,16 +133,7 @@ func UploadChunk(c *gin.Context) {
 		return
 	}
 
-	// 获取上传的文件分块
-	file, err := c.FormFile("chunk")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No chunk file provided"})
-		return
-	}
-
-	// TODO: 保存分块到临时目录
-	_ = file
-
+	log.Printf("UploadChunk success: index=%d", req.ChunkIndex)
 	c.JSON(http.StatusOK, gin.H{
 		"status":      "chunk_uploaded",
 		"chunk_index": req.ChunkIndex,
@@ -126,13 +158,20 @@ func MergeChunks(c *gin.Context) {
 	}
 
 	userID := getUserID(c)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 300*time.Second) // 大文件合并可能需要更长时间
 	defer cancel()
 
-	// TODO: 实际合并分块的逻辑
-	filePath := "/data/videos/" + req.FileHash
+	params := logic.MergeChunksParams{
+		UserID:      userID,
+		ContentID:   req.ContentID,
+		FileName:    req.FileName,
+		FileHash:    req.FileHash,
+		TotalChunks: req.TotalChunks,
+		FileSize:    req.FileSize,
+	}
 
-	if err := logic.MergeChunks(ctx, userID, req.ContentID, req.FileName, req.FileHash, filePath, req.FileSize); err != nil {
+	result, err := logic.MergeChunks(ctx, params)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -140,7 +179,8 @@ func MergeChunks(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":     "completed",
 		"content_id": req.ContentID,
-		"file_path":  filePath,
+		"file_path":  result.FilePath,
+		"file_size":  result.FileSize,
 	})
 }
 
@@ -291,4 +331,44 @@ func GetContent(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, content)
+}
+
+// DownloadFile 下载文件
+func DownloadFile(c *gin.Context) {
+	userID := getUserID(c)
+	fileHash := c.Param("id")
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	rangeHeader := c.GetHeader("Range")
+
+	result, err := logic.DownloadFile(ctx, userID, fileHash, rangeHeader)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	defer result.Reader.Close()
+
+	// 设置响应头
+	c.Header("Content-Type", result.ContentType)
+	c.Header("Accept-Ranges", "bytes")
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, result.FileName))
+
+	if result.IsRange {
+		// Range 响应
+		c.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d",
+			result.RangeStart, result.RangeEnd, result.FileSize))
+		c.Header("Content-Length", strconv.FormatInt(result.RangeLength, 10))
+		c.Status(http.StatusPartialContent)
+	} else {
+		c.Header("Content-Length", strconv.FormatInt(result.FileSize, 10))
+		c.Status(http.StatusOK)
+	}
+
+	// 流式传输
+	c.Stream(func(w io.Writer) bool {
+		_, err := io.Copy(w, result.Reader)
+		return err == nil
+	})
 }

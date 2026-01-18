@@ -42,11 +42,14 @@ func main() {
 	defer redis.Close()
 	log.Println("Redis initialized")
 
-	// 🔥 启动时从数据库加载墓碑到 Redis
+	// 初始化存储
+	logic.InitStore(config.StoragePath, config.TempPath)
+	log.Printf("Storage initialized: base=%s, temp=%s", config.StoragePath, config.TempPath)
+
+	// 启动时从数据库加载墓碑到 Redis
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	if err := logic.LoadTombstonesOnStartup(ctx); err != nil {
 		log.Printf("Warning: Failed to load tombstones: %v", err)
-		// 不致命，继续启动
 	}
 	cancel()
 
@@ -55,12 +58,18 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.Default()
+
+	// 设置最大上传大小（100MB per chunk）
+	r.MaxMultipartMemory = 100 << 20
+
 	registerRoutes(r)
 
 	// HTTP 服务器
 	srv := &http.Server{
-		Addr:    ":" + config.Port,
-		Handler: r,
+		Addr:         ":" + config.Port,
+		Handler:      r,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 300 * time.Second, // 大文件下载需要更长时间
 	}
 
 	go func() {
@@ -88,29 +97,32 @@ type Config struct {
 	RedisAddr     string
 	RedisPassword string
 	RedisDB       int
+	StoragePath   string
+	TempPath      string
 }
 
 func loadConfig() Config {
-    return Config{
-        Env:  getEnv("ENV", "development"),
-        Port: getEnv("PORT", "8080"),
-        // 优先使用完整 DB_DSN；否则从单独变量组装
-        DBDsn: func() string {
-            if dsn := os.Getenv("DB_DSN"); dsn != "" {
-                return dsn
-            }
-            user := getEnv("DB_USER", "")
-            pass := getEnv("DB_PASS", "")
-            host := getEnv("DB_HOST", "127.0.0.1")
-            port := getEnv("DB_PORT", "3306")
-            name := getEnv("DB_NAME", "videodb")
-            return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-                user, pass, host, port, name)
-        }(),
-        RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-        RedisPassword: getEnv("REDIS_PASSWORD", ""),
-        RedisDB:       0,
-    }
+	return Config{
+		Env:  getEnv("ENV", "development"),
+		Port: getEnv("PORT", "8080"),
+		DBDsn: func() string {
+			if dsn := os.Getenv("DB_DSN"); dsn != "" {
+				return dsn
+			}
+			user := getEnv("DB_USER", "root")
+			pass := getEnv("DB_PASS", "")
+			host := getEnv("DB_HOST", "127.0.0.1")
+			port := getEnv("DB_PORT", "3306")
+			name := getEnv("DB_NAME", "videodb")
+			return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+				user, pass, host, port, name)
+		}(),
+		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+		RedisDB:       0,
+		StoragePath:   getEnv("STORAGE_PATH", "/data/videos"),
+		TempPath:      getEnv("TEMP_PATH", "/tmp/video-chunks"),
+	}
 }
 
 func getEnv(key, def string) string {
@@ -127,7 +139,7 @@ func registerRoutes(r *gin.Engine) {
 
 	api := r.Group("/api/v1")
 	{
-		// 公开路由（无需认证）
+		// 公开路由
 		auth := api.Group("/auth")
 		{
 			auth.POST("/register", handler.Register)
@@ -151,6 +163,7 @@ func registerRoutes(r *gin.Engine) {
 			{
 				files.GET("", handler.ListFiles)
 				files.GET("/:id", handler.GetFile)
+				files.GET("/:id/download", handler.DownloadFile)
 				files.DELETE("/:id", handler.DeleteFile)
 			}
 
