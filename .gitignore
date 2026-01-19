@@ -1,3 +1,5 @@
 tmp/
 uploads/
 .env
+*.mp4
+data/

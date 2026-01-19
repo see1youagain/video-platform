@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.title}}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+</head>
+
+<body>
+    <nav class="navbar">
+        <a href="/" class="nav-brand">📹 视频平台</a>
+        <div class="nav-user">
+            <span id="username"></span>
+            <a href="/files">我的文件</a>
+            <a href="#" onclick="logout()">退出</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <div class="player-container">
+            <div class="player-wrapper">
+                <video id="videoPlayer" controls></video>
+            </div>
+
+            <div class="player-info">
+                <h2 id="videoTitle">加载中...</h2>
+                <p id="videoMeta"></p>
+            </div>
+
+            <div id="transcodeStatus" class="transcode-status" style="display:none;">
+                <div class="spinner"></div>
+                <p>视频正在转码中，请稍候...</p>
+                <p class="hint-small">转码完成后将自动播放</p>
+            </div>
+
+            <div id="errorState" class="error-state" style="display:none;">
+                <p>⚠️ 视频暂时无法播放</p>
+                <p id="errorMsg"></p>
+                <a href="/files" class="btn btn-secondary">返回文件列表</a>
+            </div>
+        </div>
+    </main>
+
+    <script src="/static/js/common.js"></script>
+    <script>
+        requireAuth();
+
+        const fileHash = '{{.fileHash}}';
+        const video = document.getElementById('videoPlayer');
+
+        async function loadVideo() {
+            try {
+                // 获取文件信息
+                const resp = await authFetch(`/api/v1/files/${fileHash}`);
+                if (!resp.ok) throw new Error('文件不存在');
+
+                const file = await resp.json();
+                document.getElementById('videoTitle').textContent = file.file_name;
+                document.getElementById('videoMeta').textContent = `${formatSize(file.file_size)} · ${file.created_at}`;
+
+                if (file.status === 2) {
+                    // 转码中
+                    document.getElementById('transcodeStatus').style.display = 'block';
+                    setTimeout(loadVideo, 5000); // 5秒后重试
+                    return;
+                }
+
+                // 检查是否有 HLS 流
+                const hlsResp = await authFetch(`/api/v1/hls/${fileHash}/master.m3u8`, { method: 'HEAD' });
+
+                if (hlsResp.ok) {
+                    // 播放 HLS
+                    playHLS(`/api/v1/hls/${fileHash}/master.m3u8`);
+                } else {
+                    // 直接播放原视频
+                    playDirect(`/api/v1/files/${fileHash}/download`);
+                }
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        function playHLS(url) {
+            if (Hls.isSupported()) {
+                const hls = new Hls({
+                    xhrSetup: function (xhr) {
+                        xhr.setRequestHeader('Authorization', 'Bearer ' + localStorage.getItem('token'));
+                    }
+                });
+                hls.loadSource(url);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (data.fatal) {
+                        console.error('HLS Error:', data);
+                        // 降级到直接播放
+                        playDirect(`/api/v1/files/${fileHash}/download`);
+                    }
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Safari 原生支持
+                video.src = url;
+                video.addEventListener('loadedmetadata', () => video.play());
+            } else {
+                playDirect(`/api/v1/files/${fileHash}/download`);
+            }
+        }
+
+        function playDirect(url) {
+            // 需要带 token 的请求
+            authFetch(url).then(resp => {
+                if (!resp.ok) throw new Error('无法加载视频');
+                return resp.blob();
+            }).then(blob => {
+                video.src = URL.createObjectURL(blob);
+            }).catch(err => showError(err.message));
+        }
+
+        function showError(msg) {
+            document.getElementById('errorState').style.display = 'block';
+            document.getElementById('errorMsg').textContent = msg;
+            document.querySelector('.player-wrapper').style.display = 'none';
+        }
+
+        loadVideo();
+    </script>
+</body>
+
+</html>

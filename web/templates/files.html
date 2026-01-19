@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.title}}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <nav class="navbar">
+        <a href="/" class="nav-brand"> 视频平台</a>
+        <div class="nav-user">
+            <span id="username"></span>
+            <a href="/upload">上传</a>
+            <a href="#" onclick="logout()">退出</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <div class="files-header">
+            <h2>我的文件</h2>
+            <a href="/upload" class="btn btn-primary">+ 上传新文件</a>
+        </div>
+
+        <div id="loading" class="loading">加载中...</div>
+        <div id="emptyState" class="empty-state" style="display:none;">
+            <p> 暂无文件</p>
+            <a href="/upload" class="btn btn-primary">上传第一个视频</a>
+        </div>
+
+        <div id="filesList" class="files-grid"></div>
+    </main>
+
+    <script src="/static/js/common.js"></script>
+    <script>
+        requireAuth();
+
+        async function loadFiles() {
+            try {
+                const resp = await authFetch('/api/v1/files');
+                const data = await resp.json();
+
+                document.getElementById('loading').style.display = 'none';
+
+                if (!data.files || data.files.length === 0) {
+                    document.getElementById('emptyState').style.display = 'block';
+                    return;
+                }
+
+                const container = document.getElementById('filesList');
+                container.innerHTML = data.files.map(f => `
+                    <div class="file-card">
+                        <div class="file-icon">${getFileIcon(f.file_name)}</div>
+                        <div class="file-info">
+                            <h4 class="file-name" title="${f.file_name}">${f.file_name}</h4>
+                            <p class="file-meta">
+                                ${formatSize(f.file_size)} · ${getStatusText(f.status)}
+                            </p>
+                            <p class="file-hash" title="${f.file_hash}">${f.file_hash.substring(0, 16)}...</p>
+                        </div>
+                        <div class="file-actions">
+                            ${f.status === 1 ? `
+                                <a href="/play/${f.file_hash}" class="btn btn-sm">▶ 播放</a>
+                                <a href="#" onclick="downloadFile('${f.file_hash}', '${f.file_name}')" class="btn btn-sm btn-secondary">下载</a>
+                            ` : ''}
+                            <button onclick="deleteFile('${f.file_hash}')" class="btn btn-sm btn-danger">删除</button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) {
+                document.getElementById('loading').innerHTML = '加载失败: ' + err.message;
+            }
+        }
+
+        function getFileIcon(name) {
+            const ext = name.split('.').pop().toLowerCase();
+            const icons = { mp4: '🎬', mkv: '🎬', avi: '🎬', mov: '🎬', webm: '🎬', mp3: '🎵', wav: '🎵' };
+            return icons[ext] || '📄';
+        }
+
+        function getStatusText(status) {
+            return { 0: '上传中', 1: '已完成', 2: '转码中', 3: '已转码', '-1': '已取消' }[status] || '未知';
+        }
+
+        async function downloadFile(hash, name) {
+            const resp = await authFetch(`/api/v1/files/${hash}/download`);
+            if (!resp.ok) {
+                alert('下载失败');
+                return;
+            }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        async function deleteFile(hash) {
+            if (!confirm('确定要删除此文件吗？')) return;
+            try {
+                const resp = await authFetch(`/api/v1/files/${hash}`, { method: 'DELETE' });
+                if (resp.ok) {
+                    loadFiles();
+                } else {
+                    const data = await resp.json();
+                    alert('删除失败: ' + (data.error || '未知错误'));
+                }
+            } catch (err) {
+                alert('删除失败: ' + err.message);
+            }
+        }
+
+        loadFiles();
+    </script>
+</body>
+
+</html>

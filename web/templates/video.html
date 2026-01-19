@@ -1,0 +1,46 @@
+{{define "content"}}
+<div class="container">
+    <div class="video-player-container">
+        <video id="video-player" controls>
+            <source src="/api/v1/files/{{.FileHash}}/download" type="video/mp4">
+            您的浏览器不支持视频播放
+        </video>
+    </div>
+
+    <div class="video-details">
+        <h1 id="video-title">加载中...</h1>
+        <div class="video-meta" id="video-meta"></div>
+    </div>
+
+    <div class="video-actions">
+        <a href="/api/v1/files/{{.FileHash}}/download" class="btn btn-secondary" download>下载视频</a>
+        <button class="btn btn-danger" id="delete-btn">删除视频</button>
+    </div>
+</div>
+
+<script>
+    const fileHash = '{{.FileHash}}';
+
+    document.addEventListener('DOMContentLoaded', async function () {
+        try {
+            const file = await API.getFile(fileHash);
+            document.getElementById('video-title').textContent = file.file_name;
+            document.getElementById('video-meta').innerHTML =
+                `大小: ${formatSize(file.file_size)} · 上传时间: ${file.created_at}`;
+        } catch (e) {
+            document.getElementById('video-title').textContent = '视频不存在';
+        }
+    });
+
+    document.getElementById('delete-btn').addEventListener('click', async function () {
+        if (!confirm('确定要删除这个视频吗？')) return;
+        try {
+            await API.deleteFile(fileHash);
+            alert('删除成功');
+            window.location.href = '/';
+        } catch (e) {
+            alert('删除失败: ' + e.message);
+        }
+    });
+</script>
+{{end}}

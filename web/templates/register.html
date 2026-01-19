@@ -1,0 +1,47 @@
+{{define "content"}}
+<div class="auth-container">
+    <div class="auth-box">
+        <h2>注册</h2>
+        <form id="register-form">
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" required placeholder="请输入用户名" minlength="3">
+            </div>
+            <div class="form-group">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" required placeholder="请输入密码" minlength="6">
+            </div>
+            <div class="form-group">
+                <label for="confirm-password">确认密码</label>
+                <input type="password" id="confirm-password" required placeholder="请再次输入密码">
+            </div>
+            <div class="form-error" id="register-error"></div>
+            <button type="submit" class="btn btn-primary">注册</button>
+        </form>
+        <p class="auth-link">已有账号？<a href="/login">立即登录</a></p>
+    </div>
+</div>
+
+<script>
+    document.getElementById('register-form').addEventListener('submit', async function (e) {
+        e.preventDefault();
+        const username = document.getElementById('username').value;
+        const password = document.getElementById('password').value;
+        const confirmPassword = document.getElementById('confirm-password').value;
+        const errorEl = document.getElementById('register-error');
+
+        if (password !== confirmPassword) {
+            errorEl.textContent = '两次密码输入不一致';
+            return;
+        }
+
+        try {
+            await API.register(username, password);
+            alert('注册成功，请登录');
+            window.location.href = '/login';
+        } catch (err) {
+            errorEl.textContent = err.message || '注册失败';
+        }
+    });
+</script>
+{{end}}

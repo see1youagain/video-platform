@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}} - VideoHub</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="/static/js/api.js"></script>
+</head>
+
+<body>
+    <nav class="navbar">
+        <div class="nav-container">
+            <a href="/" class="logo"> VideoHub</a>
+            <div class="nav-links">
+                <a href="/">首页</a>
+                <a href="/upload">上传</a>
+            </div>
+            <div class="nav-user" id="nav-user">
+                <!-- JS 动态填充 -->
+            </div>
+        </div>
+    </nav>
+
+    <main class="main-content">
+        {{template "content" .}}
+    </main>
+
+    <footer class="footer">
+        <p>&copy; 2024 VideoHub. All rights reserved.</p>
+    </footer>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

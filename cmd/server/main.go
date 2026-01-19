@@ -20,10 +20,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var config Config
+
 func main() {
 	_ = godotenv.Load()
 
-	config := loadConfig()
+	config = loadConfig()
 
 	// 初始化数据库
 	if err := db.InitDB(config.DBDsn); err != nil {
@@ -91,14 +93,16 @@ func main() {
 }
 
 type Config struct {
-	Env           string
-	Port          string
-	DBDsn         string
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
-	StoragePath   string
-	TempPath      string
+	Env             string
+	Port            string
+	DBDsn           string
+	RedisAddr       string
+	RedisPassword   string
+	RedisDB         int
+	StoragePath     string
+	TempPath        string
+	WebStaticPath   string
+	WebTemplatePath string
 }
 
 func loadConfig() Config {
@@ -122,6 +126,8 @@ func loadConfig() Config {
 		RedisDB:       0,
 		StoragePath:   getEnv("STORAGE_PATH", "/data/videos"),
 		TempPath:      getEnv("TEMP_PATH", "/tmp/video-chunks"),
+		WebStaticPath: getEnv("WEB_STATIC_PATH", "./web/static"),
+		WebTemplatePath: getEnv("WEB_TEMPLATE_PATH", "./web/templates"),
 	}
 }
 
@@ -133,6 +139,9 @@ func getEnv(key, def string) string {
 }
 
 func registerRoutes(r *gin.Engine) {
+	// 设置 Web 路由（静态文件和页面）
+	handler.SetupWebRoutes(r, config.WebStaticPath, config.WebTemplatePath)
+	
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
